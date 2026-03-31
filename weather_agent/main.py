@@ -1,7 +1,8 @@
 import os
-import re
+import json
 import time
 import sys
+import requests
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -60,38 +61,107 @@ def select_model():
         
     client = OpenAI(api_key=api_key, base_url=base_url)
 
-# 2. Define Tools (Mock Weather Function)
+# 2. Define Tools
 def get_weather(city):
     """Simulates an API call to get weather data."""
     # In a real scenario, this would request an external API
     if "tokyo" in city.lower():
-        return '{"temp": 15, "condition": "rainy"}'
+        return json.dumps({"temp": 15, "condition": "rainy"})
     elif "new york" in city.lower():
-        return '{"temp": 20, "condition": "sunny"}'
+        return json.dumps({"temp": 20, "condition": "sunny"})
     else:
-        return '{"temp": 25, "condition": "cloudy"}'
+        return json.dumps({"temp": "unknown", "condition": "unknown"})
 
-# 3. Define System Prompt (The "Brain" instructions)
+def search_web(query):
+    """Real web search using Brave Search API."""
+    print_log("TOOL_INTERNAL", f"Searching web for: {query}", Colors.YELLOW)
+    
+    api_key = os.getenv("BRAVE_API_KEY")
+    if not api_key or api_key == "your_brave_api_key_here":
+        # 不再 fallback，而是明确抛出异常或返回明确的错误信息让 LLM 知道工具不可用
+        error_msg = "Error: BRAVE_API_KEY is not configured or is invalid. Real web search is unavailable."
+        print_log("ERROR", error_msg, Colors.YELLOW)
+        return error_msg
+
+    try:
+        url = "https://api.search.brave.com/res/v1/web/search"
+        headers = {
+            "Accept": "application/json",
+            "X-Subscription-Token": api_key
+        }
+        params = {"q": query, "count": 3} # Limit to top 3 results to save token context
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Extract snippets from the top results
+        results = data.get("web", {}).get("results", [])
+        if not results:
+            return "No relevant results found on the web."
+            
+        snippets = []
+        for i, item in enumerate(results):
+            title = item.get("title", "No Title")
+            desc = item.get("description", "No Description")
+            snippets.append(f"[{i+1}] {title}: {desc}")
+            
+        # Return a concatenated string of snippets for the LLM to read
+        return "\n".join(snippets)
+        
+    except Exception as e:
+        print_log("ERROR", f"Brave Search API failed: {e}", Colors.YELLOW)
+        return f"Error occurred during web search: {str(e)}"
+
+# Tool Definitions for OpenAI API
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a specific city.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string",
+                        "description": "The name of the city, e.g. Tokyo, New York"
+                    }
+                },
+                "required": ["city"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Search the web for general knowledge, news, or facts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query string"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
+
+# 3. Define System Prompt (Simplified for Function Calling)
 SYSTEM_PROMPT = """
-You are a helpful AI assistant with access to a weather tool.
-To answer the user's question, you must follow this Thought-Action-Observation loop:
-
-1. **Thought**: Analyze what you need to do.
-2. **Action**: If you need data, output exactly: `call: get_weather("CityName")`
-3. **Observation**: **STOP! Do not generate this part.** I will give you the tool result.
-4. ...Repeat until you have the answer...
-5. **Final Answer**: You MUST start your final response with "Final Answer:" followed by the answer.
-
-**Rules:**
-- Do not make up or guess tool results.
-- Wait for the user to provide the "Observation".
-- If you have the answer, use "Final Answer:".
-
-Available Tools:
-- get_weather(city): Returns weather data (temp, condition).
+You are a helpful AI assistant.
+Use your general knowledge for simple facts, but use search_web for real-time news.
 """
+# SYSTEM_PROMPT = """
+# You are a helpful AI assistant.
+# Use the available tools to answer the user's question. 
+# Always verify facts using the `search_web` tool, even if you think you know the answer.
+# """
 
-# 4. The Agent Loop (ReAct Logic)
+# 4. The Agent Loop (Function Calling Logic)
 def run_agent(user_query):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -101,16 +171,31 @@ def run_agent(user_query):
     print_log("USER", f"Query: {user_query}", Colors.BOLD)
     print("-" * 50)
     
-    for step in range(5): # Max 5 steps to prevent infinite loops
+    for step in range(3): # Reverted to 5 steps
         print_log("AGENT", f"Step {step + 1}: Thinking...", Colors.CYAN)
         
-        # Call LLM
+        # Log EXACTLY what is being sent to the LLM
+        print_log("DEBUG: REQUEST TO LLM", "Payload being sent:", Colors.BOLD)
+        payload = {
+            "model": MODEL_ID,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "temperature": 0
+        }
+        # Print using json.dumps for clear formatting. 
+        # Note: messages might contain objects (like previous responses) so we use a custom default handler.
+        print(f"{Colors.YELLOW}{json.dumps(payload, indent=2, default=str)}{Colors.RESET}\n")
+
+        # Call LLM with tools
         start_time = time.time()
         try:
             response = client.chat.completions.create(
                 model=MODEL_ID,
                 messages=messages,
-                temperature=0  # Deterministic for tools
+                tools=tools,
+                tool_choice="auto", # Let model decide
+                temperature=0
             )
         except Exception as e:
             print_log("ERROR", f"API Call failed: {e}", Colors.YELLOW)
@@ -118,41 +203,54 @@ def run_agent(user_query):
 
         end_time = time.time()
         
-        response_text = response.choices[0].message.content
+        # Log EXACTLY what was received from the LLM
+        print_log("DEBUG: RESPONSE FROM LLM", "Raw Response Object:", Colors.BOLD)
+        # response.model_dump() converts the pydantic object to a dictionary
+        print(f"{Colors.GREEN}{json.dumps(response.model_dump(), indent=2)}{Colors.RESET}\n")
         
-        # Add agent response to history
-        messages.append({"role": "assistant", "content": response_text})
+        response_message = response.choices[0].message
         
-        # Print the Agent's raw output (Thought & Action)
-        print(f"{Colors.GREEN}{response_text}{Colors.RESET}\n")
-        print_log("META", f"Time taken: {end_time - start_time:.2f}s", Colors.CYAN)
+        # Add agent response to history (crucial for function calling flow)
+        messages.append(response_message)
         
-        # Check for "Final Answer"
-        if "Final Answer" in response_text:
-            return response_text
+        # Check if model wants to call a tool
+        tool_calls = response_message.tool_calls
+        
+        if tool_calls:
+            # Model wants to call tools
+            print(f"{Colors.GREEN}Thought: I need to call tools.{Colors.RESET}\n")
+            print_log("META", f"Time taken: {end_time - start_time:.2f}s", Colors.CYAN)
             
-        # Check for "Action" (Regex to find `call: get_weather("...")`)
-        # Supports both single and double quotes, and optional spaces
-        match = re.search(r'call:\s*get_weather\s*\(\s*[\'"](.+?)[\'"]\s*\)', response_text)
-        if match:
-            city = match.group(1)
-            print_log("TOOL", f"Executing: get_weather('{city}')", Colors.YELLOW)
-            
-            # Simulate Tool Execution
-            observation = get_weather(city)
-            print_log("OBSERVATION", f"Result: {observation}", Colors.YELLOW)
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                function_args = json.loads(tool_call.function.arguments)
+                
+                print_log("TOOL", f"Executing: {function_name}({function_args})", Colors.YELLOW)
+                
+                # Execute tool
+                tool_output = None
+                if function_name == "get_weather":
+                    tool_output = get_weather(function_args.get("city"))
+                elif function_name == "search_web":
+                    tool_output = search_web(function_args.get("query"))
+                
+                print_log("OBSERVATION", f"Result: {tool_output}", Colors.YELLOW)
+                
+                # Send tool result back to model
+                messages.append({
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "name": function_name,
+                    "content": str(tool_output)
+                })
             print("-" * 50)
-            
-            # Feed observation back to LLM
-            messages.append({
-                "role": "user", 
-                "content": f"Observation: {observation}"
-            })
         else:
-            # If no action and no final answer, maybe it's just thinking or asking for more info
-            pass
+            # Model has Final Answer (no tool calls)
+            print(f"{Colors.GREEN}{response_message.content}{Colors.RESET}\n")
+            print_log("META", f"Time taken: {end_time - start_time:.2f}s", Colors.CYAN)
+            return response_message.content
 
 if __name__ == "__main__":
     select_model()
-    # Test the agent
-    run_agent("What should I wear in New York today?")
+    # Test cases
+    run_agent("What is the weather of the capital of Japan?")
